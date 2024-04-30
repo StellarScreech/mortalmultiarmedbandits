@@ -191,7 +191,7 @@ if trainingmode == 1:
     #wait
     time.sleep(3)
     # Train the model
-    leader.train_model(500, train_data, train_labels)
+    leader.train_model(10, train_data, train_labels)
 else:
     if trainingmode == 0:
         leader.load_model()
