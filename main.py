@@ -3,24 +3,29 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.nn.utils.rnn import pad_sequence
 import time
-
-
-import os
 
 class MineSelectionModel(nn.Module):
     def __init__(self, num_mines):
         super(MineSelectionModel, self).__init__()
-        self.fc1 = nn.Linear(num_mines * 2 + 1, 64)
-        self.fc2 = nn.Linear(64, 64)
-        self.fc3 = nn.Linear(64, num_mines)
+        self.rnn = nn.RNN(num_mines * 2 + 1, 128, num_layers=2, batch_first=True, dropout=0.33)
+        self.fc1 = nn.Linear(128, 256)
+        self.dropout1 = nn.Dropout(0.5)
+        self.fc2 = nn.Linear(256, 128)
+        self.dropout2 = nn.Dropout(0.5)
+        self.fc3 = nn.Linear(128, num_mines)
 
     def forward(self, x):
-        x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
-        x = torch.softmax(self.fc3(x), dim=0)
-        return x
-
+        h0 = torch.zeros(2, 1, 128).to(x.device)  # make h0 a 1-D tensor
+        out, _ = self.rnn(x.unsqueeze(0), h0)  # add an extra dimension to x and h0
+        out = out.squeeze(0)  # remove the extra dimension from out
+        out = self.fc1(out)
+        out = self.dropout1(out)
+        out = self.fc2(out)
+        out = self.dropout2(out)
+        out = self.fc3(out)
+        return torch.softmax(out, dim=0)
 
 class Mine:
     MIN_FACTOR = 0.7
@@ -59,7 +64,6 @@ class Mine:
         self.under_threat = True
         self.capture_day = day
 
-
 class Rebels:
     ATTACK_PERIOD = 10
     ATTACK_SUCCESS_PROBABILITY = 0.05
@@ -75,53 +79,23 @@ class Rebels:
                 continue
             mine.capture(day)
 
-
 class SupremeLeader:
-
-    def train_model(self, epochs, train_data, train_labels):
-        train_data = train_data.float()  # Convert train_data to Float
-        train_labels = train_labels.float()  # Convert train_labels to Float
-        for epoch in range(epochs):
-            self.model.train()  # Set the model to training mode
-            self.optimizer.zero_grad()  # Reset gradients
-
-            # Ensure the input data has the correct shape
-            train_data = train_data.view(-1, len(self.mines) * 2 + 1)
-
-            outputs = self.model(train_data)  # Forward pass
-            reward = self.play_game()  # Get reward or penalty
-            loss = -reward * self.criterion(outputs, train_labels.long())  # Multiply loss by reward or penalty
-            loss.backward()  # Backward pass
-            self.optimizer.step()  # Update weights
-
-            print(f'Epoch {epoch + 1}/{epochs}, Loss: {loss.item()}')
-
-        # Save the model's state after training
-        torch.save(self.model.state_dict(), 'model_state.pth')
-
-
-    def load_model(self):
-        # Load the model's state from the file
-        self.model.load_state_dict(torch.load('model_state.pth'))
-        self.model.eval()  # Set the model to evaluation mode
     def __init__(self, num_mines, target_earnings):
         self.target_earnings = target_earnings
         self.total_earned = 0
         self.mines = [Mine(i, random.randint(1000, 4000)) for i in range(num_mines)]
-        self.mine_expected_values = {}
         self.model = MineSelectionModel(num_mines)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=0.5)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.5, weight_decay=0.05)
         self.criterion = nn.CrossEntropyLoss()
-
 
     def select_mine(self, day):
         mine_values = []
         for mine in self.mines:
             if mine.is_under_threat():
-                mine_values.extend([0, 0])  # Append two default values if mine is under threat
+                mine_values.extend([0, 0])
                 continue
             if mine.days_worked == 0:
-                mine_values.extend([0, 0])  # Append two default values if mine.days_worked is zero
+                mine_values.extend([0, 0])
             else:
                 mine_values.extend([mine.total_extracted_gold, mine.days_worked])
 
@@ -134,9 +108,9 @@ class SupremeLeader:
         mine_probabilities = self.model(mine_values)
         mine_probabilities = mine_probabilities.squeeze().detach().numpy()
 
-        # Check if all weights are finite
         if not np.all(np.isfinite(mine_probabilities)):
             mine_probabilities = np.ones_like(mine_probabilities) / len(mine_probabilities)
+
         selected_mine = random.choices(self.mines, mine_probabilities)[0]
         return selected_mine, mine_probabilities
 
@@ -149,53 +123,109 @@ class SupremeLeader:
 
     def play_game(self):
         rebels = Rebels()
-        correct_predictions = 0
+        game_data = []
         for day in range(365):
-            selected_mine, _ = self.exploit_mines(day)
-            rebels.move(day, self.mines)
-            best_mine = max(self.mines, key=lambda mine: mine.total_extracted_gold)
-            if selected_mine == best_mine:
-                correct_predictions += 1
-        accuracy = correct_predictions / 365
-        if self.total_earned > self.target_earnings:
-            return 2  # Return reward
-        else:
-            return -1  # Return penalty
+            selected_mine, mine_probabilities = self.exploit_mines(day)
+            mine_features = []
+            for mine in self.mines:
+                if mine.is_under_threat():
+                    mine_features.extend([0, 0])
+                    continue
+                if mine.days_worked == 0:
+                    mine_features.extend([0, 0])
+                else:
+                    mine_features.extend([mine.total_extracted_gold, mine.days_worked])
+            mine_features.append(day)
+            game_data.append((mine_features, selected_mine.get_ordinal_number()))
+        reward = (self.total_earned / self.target_earnings) * 2 if self.total_earned > self.target_earnings else -1
+        return game_data, reward
 
+    def train_model(self, epochs, train_data, train_labels):
+        train_data = train_data.float()
+        train_labels = train_labels.float()
+        for epoch in range(epochs):
+            self.model.train()
+            self.optimizer.zero_grad()
+            outputs = self.model(train_data)
+            _, reward = self.play_game()  # Unpack the results of play_game
+            loss = -reward * self.criterion(outputs, train_labels.long())
+            loss.backward()
+            self.optimizer.step()
+            print(f'Epoch {epoch + 1}/{epochs}, Loss: {loss.item()}')
+        torch.save(self.model.state_dict(), 'rnnstate.pth')
 
-
+    def load_model(self):
+        self.model.load_state_dict(torch.load('rnnstate.pth'))
+        self.model.eval()
 
 # end line
-num_wins = 0
-num_losses = 0
-# Create an instance of SupremeLeader
+
+amount_of_games = 100  # Increase this number
+
+# Vary the number of mines and target earnings
+trainingmode = int(input("Enter 1 for training mode, 0 for testing mode: "))
 leader = SupremeLeader(num_mines=10, target_earnings=1000000)
-trainingmode=int(input("Enter 1 for training mode, 0 for testing mode: "))
+num_mines=10
+target_earnings=1000000
+if trainingmode == 1:
+    print("---------------BEGIN DATA COLLECTION--------------")
+    #wait
+    time.sleep(3)
+    train_data = []
+    train_labels = []
 
-if trainingmode==1:
-    train_data = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
-                               [22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42]])
-    leader.train_model(100, train_data, torch.tensor([0, 1]))
-else:
-    # Load the trained model
-    leader.load_model()
 
-    amount_of_games = 1000
+    leader = SupremeLeader(num_mines=num_mines, target_earnings=target_earnings)
     for _ in range(amount_of_games):
-        leader = SupremeLeader(10, 1000000)
-        #clear console
-        print("game #", _, "/", amount_of_games)
+        game_data, reward = leader.play_game()
+        for data, label in game_data:
+            train_data.append(data)
+            train_labels.append(label * min(1, abs(reward)))  # Weigh the labels by the reward
+        print(f'Number of mines: {num_mines}, Target earnings: {target_earnings}, Total earned: {leader.total_earned}')
 
-        leader.play_game()
-        if leader.total_earned > leader.target_earnings:
-            num_wins += 1
-        else:
-            num_losses += 1
+    # Convert lists to tensors
+    train_data = [torch.tensor(data) for data in train_data]
+    train_data = pad_sequence(train_data, batch_first=True)
+    train_labels = torch.tensor(train_labels)
+    print("---------------BEGIN TRAINING--------------")
+    #wait
+    time.sleep(3)
+    # Train the model
+    leader.train_model(500, train_data, train_labels)
+else:
+    if trainingmode == 0:
+        leader.load_model()
+        num_wins = 0
+        num_losses = 0
+        amount_of_games = 100
+        for _ in range(amount_of_games):
+            leader = SupremeLeader(num_mines=num_mines, target_earnings=target_earnings)
+            print("game #", _, "/", amount_of_games)
+            leader.play_game()
+            if leader.total_earned > leader.target_earnings:
+                num_wins += 1
+            else:
+                num_losses += 1
 
-    win_rate = num_wins / (num_wins + num_losses) * 100
-    loss_rate = num_losses / (num_wins + num_losses) * 100
+        win_rate = num_wins / (num_wins + num_losses) * 100
+        loss_rate = num_losses / (num_wins + num_losses) * 100
 
-    print("<---------------------------------------->")
-    print(f"Win rate (executed {num_wins + num_losses} times): {win_rate:.2f}%")
-    print(f"Loss rate (executed {num_wins + num_losses} times): {loss_rate:.2f}%")
+        print("<---------------------------------------->")
+        print(f"Win rate (executed {num_wins + num_losses} times): {win_rate:.2f}%")
+        print(f"Loss rate (executed {num_wins + num_losses} times): {loss_rate:.2f}%")
+
+
+
+
+# Collect the data from the game and use it for training
+# # Create an instance of SupremeLeader
+#
+# trainingmode = int(input("Enter 1 for training mode, 0 for testing mode: "))
+#
+# if trainingmode == 1:
+#     train_data = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
+#                                [22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42]])
+#     leader.train_model(20, train_data, torch.tensor([0, 1]))
+# else:
+# Load the trained model
 
